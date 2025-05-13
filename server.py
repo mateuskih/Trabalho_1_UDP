@@ -5,280 +5,171 @@ import struct
 import zlib
 import time
 import select
-from typing import Tuple, Optional, Dict
+import logging
+from typing import Tuple, Dict
 
-# Constants for the protocol
-MAGIC_NUMBER = 0x0000 
-MAX_PAYLOAD = 1024
-HEADER_SIZE = 18
-TIMEOUT = 0.5  # seconds
-MAX_RETRIES = 5
+# Configuração de logging com timestamp
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s [%(levelname)s] %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
 
-# Packet types
+# --- Configurações do protocolo ---
+MAGIC_NUMBER = 0x0000       # Número mágico para identificação de pacotes válidos
+MAX_PAYLOAD = 1024 * 8      # 8 KB por segmento
+HEADER_SIZE = 18            # Header + checksum
+TIMEOUT = 0.5               # Timeout para retransmissão (s)
+MAX_RETRIES = 5             # Máximo de retransmissões
+
+# Tipos de pacote
 TYPE_REQUEST = 0
-TYPE_DATA = 1
-TYPE_ACK = 2
-TYPE_ERROR = 3
+TYPE_DATA    = 1
+TYPE_ACK     = 2
+TYPE_ERROR   = 3
 
 # Flags
-FLAG_LAST = 1
 FLAG_NORMAL = 0
+FLAG_LAST   = 1
+
+
+def compute_checksum(data: bytes) -> bytes:
+    """
+    Calcula checksum CRC32 em 4 bytes big-endian
+    """
+    checksum = zlib.crc32(data) & 0xFFFFFFFF
+    return struct.pack('!I', checksum)
 
 class UDPServer:
     def __init__(self, port: int, directory: str):
-        self.port = port
-        self.directory = directory
+        """
+        Inicia socket UDP e prepara estado
+        """
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(('', port))
-        self.clients: Dict[Tuple[str, int], dict] = {}
-        print(f"Server started on port {port}, serving files from {directory}")
-        
+        self.socket.bind(("", port))
+        self.directory = directory
+        self.clients: Dict[Tuple[str,int], dict] = {}
+        logging.info(f"Servidor iniciado em 0.0.0.0:{port}, servindo {directory}")
+
     def run(self):
-        """Main server loop to handle client requests"""
-        while True:
-            try:
-                # Wait for data from any client
-                ready = select.select([self.socket], [], [], 1.0)
-                if ready[0]:
-                    data, client_address = self.socket.recvfrom(2048)
-                    self.handle_packet(data, client_address)
-                
-                # Check for clients that need retransmission
+        """Loop: receber pacotes e retransmitir"""
+        try:
+            while True:
+                ready,_,_ = select.select([self.socket], [], [], 1.0)
+                if ready:
+                    data, addr = self.socket.recvfrom(MAX_PAYLOAD + HEADER_SIZE)
+                    logging.info(f"Pacote recebido de {addr}, tamanho {len(data)} bytes")
+                    self.handle_packet(data, addr)
                 self.check_retransmissions()
-                    
-            except KeyboardInterrupt:
-                print("Server shutting down...")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
+        except KeyboardInterrupt:
+            logging.info("Servidor encerrado pelo usuário")
 
-    def handle_packet(self, data: bytes, client_address: Tuple[str, int]):
-        """Process received packet based on its type"""
-        try:
-            # Parse the header
-            if len(data) < HEADER_SIZE:
-                print(f"Received malformed packet from {client_address}")
-                return
-                
-            magic, packet_type, seq_num, payload_size, total_segments, flags, received_checksum = struct.unpack(
-                '!HIBHIB4s', data[:HEADER_SIZE]
-            )
-            
-            # Verify magic number
-            if magic != MAGIC_NUMBER:
-                print(f"Invalid magic number from {client_address}")
-                return
-                
-            # Extract the payload
-            payload = data[HEADER_SIZE:HEADER_SIZE + payload_size]
-            
-            # Verify checksum (excluding the checksum field itself)
-            checksum_data = data[:HEADER_SIZE-4] + data[HEADER_SIZE:]
-            calculated_checksum = zlib.crc32(checksum_data) & 0xFFFFFFFF
-            received_checksum = int.from_bytes(received_checksum, byteorder='big')
-            
-            if calculated_checksum != received_checksum:
-                print(f"Checksum mismatch from {client_address}: expected {calculated_checksum}, got {received_checksum}")
-                return
-                
-            # Handle by packet type
-            if packet_type == TYPE_REQUEST:
-                self.handle_request(payload.decode('utf-8'), client_address)
-            elif packet_type == TYPE_ACK:
-                self.handle_ack(seq_num, client_address)
-            else:
-                print(f"Unexpected packet type {packet_type} from {client_address}")
-                
-        except Exception as e:
-            print(f"Error handling packet: {e}")
+    def handle_packet(self, data: bytes, addr: Tuple[str,int]):
+        if len(data) < HEADER_SIZE:
+            logging.warning(f"Pacote muito curto de {addr}")
+            return
+        header = data[:HEADER_SIZE]
+        magic, ptype, seq, size, total, flags, recv_checksum = \
+            struct.unpack('!HBIH I B4s'.replace(' ', ''), header)
+        if magic != MAGIC_NUMBER:
+            logging.warning(f"Magic inválido de {addr}")
+            return
+        payload = data[HEADER_SIZE:HEADER_SIZE+size]
+        calc = compute_checksum(header[:-4] + payload)
+        if calc != recv_checksum:
+            logging.error(f"CRC inválido de {addr}, seq={seq}")
+            return
+        # Processa tipos
+        if ptype == TYPE_REQUEST:
+            text = payload.decode('utf-8')
+            if text.startswith("GET /"):
+                filename = text[5:]
+                logging.info(f"Requisição GET de {addr}: {filename}")
+                self.start_transfer(filename, addr)
+            elif text.startswith("RESEND "):
+                seq_req = int(text.split()[1])
+                logging.info(f"Requisição RESEND de {addr}: seq={seq_req}")
+                self.resend_segment(addr, seq_req)
+        elif ptype == TYPE_ACK:
+            logging.info(f"ACK recebido de {addr}, seq={seq}")
+            self.handle_ack(addr, seq)
 
-    def handle_request(self, request: str, client_address: Tuple[str, int]):
-        """Process a file request from client"""
-        if not request.startswith("GET /"):
-            self.send_error(client_address, "Invalid request format")
+    def start_transfer(self, filename: str, addr: Tuple[str,int]):
+        path = os.path.join(self.directory, filename)
+        if not os.path.exists(path):
+            self.send_error(addr, f"Arquivo {filename} não encontrado")
             return
-            
-        # Extract filename from request
-        filename = request[5:].strip()
-        file_path = os.path.join(self.directory, filename)
-        
-        print(f"Client {client_address} requested file: {filename}")
-        
-        # Check if file exists
-        if not os.path.exists(file_path):
-            self.send_error(client_address, f"File {filename} not found")
+        filesize = os.path.getsize(path)
+        total_segments = (filesize + MAX_PAYLOAD - 1) // MAX_PAYLOAD
+        file_obj = open(path, 'rb')
+        self.clients[addr] = {
+            'file': file_obj,
+            'total': total_segments,
+            'current': 0,
+            'last_send': 0.0,
+            'retries': 0,
+            'start_time': time.time()
+        }
+        logging.info(f"Iniciando transferência de {filename}: {filesize} bytes em {total_segments} segmentos para {addr}")
+        self.send_next(addr)
+
+    def send_next(self, addr: Tuple[str,int]):
+        st = self.clients.get(addr)
+        if not st: return
+        i, total = st['current'], st['total']
+        if i >= total:
+            duration = time.time() - st['start_time']
+            logging.info(f"Transferência completa para {addr} em {duration:.2f}s")
             return
-            
-        # Prepare for file transfer
-        try:
-            file_size = os.path.getsize(file_path)
-            total_segments = (file_size + MAX_PAYLOAD - 1) // MAX_PAYLOAD
-            
-            # Create client state
-            self.clients[client_address] = {
-                'file': open(file_path, 'rb'),
-                'filename': filename,
-                'file_size': file_size,
-                'total_segments': total_segments,
-                'current_segment': 0,
-                'last_send_time': 0,
-                'retries': 0
-            }
-            
-            print(f"Starting transfer of {filename} ({file_size} bytes, {total_segments} segments)")
-            # Send first segment
-            self.send_next_segment(client_address)
-            
-        except Exception as e:
-            self.send_error(client_address, f"Error preparing file: {e}")
-    
-    def send_next_segment(self, client_address: Tuple[str, int]) -> bool:
-        """Send the next file segment to the client"""
-        client = self.clients.get(client_address)
-        if not client:
-            return False
-            
-        file = client['file']
-        current_segment = client['current_segment']
-        total_segments = client['total_segments']
-        
-        if current_segment >= total_segments:
-            # Transfer complete
-            file.close()
-            del self.clients[client_address]
-            print(f"File transfer to {client_address} completed!")
-            return False
-            
-        # Read payload from file
-        file.seek(current_segment * MAX_PAYLOAD)
-        payload = file.read(MAX_PAYLOAD)
-        
-        # Determine if this is the last segment
-        is_last = (current_segment == total_segments - 1)
-        flags = FLAG_LAST if is_last else FLAG_NORMAL
-        
-        # Send the data packet
-        self.send_data_packet(client_address, current_segment, payload, total_segments, flags)
-        
-        # Update client state
-        client['last_send_time'] = time.time()
-        return True
-        
-    def send_data_packet(self, client_address: Tuple[str, int], seq_num: int, payload: bytes, 
-                         total_segments: int, flags: int):
-        """Create and send a DATA packet"""
-        # Prepare header without checksum
-        header_without_checksum = struct.pack(
-            '!HIBHIB', 
-            MAGIC_NUMBER, 
-            TYPE_DATA, 
-            seq_num, 
-            len(payload), 
-            total_segments,
-            flags
-        )
-        
-        # Calculate checksum over header (without checksum field) + payload
-        checksum = zlib.crc32(header_without_checksum + payload) & 0xFFFFFFFF
-        
-        # Complete header with checksum
-        header = header_without_checksum + struct.pack('!I', checksum)
-        
-        # Send the packet
-        self.socket.sendto(header + payload, client_address)
-        
-        print(f"Sent segment {seq_num}/{total_segments-1} to {client_address} ({len(payload)} bytes)")
-    
-    def handle_ack(self, seq_num: int, client_address: Tuple[str, int]):
-        """Process ACK from client"""
-        client = self.clients.get(client_address)
-        if not client:
-            print(f"Received ACK from unknown client {client_address}")
-            return
-            
-        if seq_num == client['current_segment']:
-            print(f"Received ACK for segment {seq_num} from {client_address}")
-            
-            # Move to next segment
-            client['current_segment'] += 1
-            client['retries'] = 0
-            
-            # Send next segment
-            self.send_next_segment(client_address)
-        else:
-            print(f"Received out-of-order ACK from {client_address}: got {seq_num}, expected {client['current_segment']}")
-    
+        file_obj = st['file']
+        file_obj.seek(i * MAX_PAYLOAD)
+        chunk = file_obj.read(MAX_PAYLOAD)
+        flags = FLAG_LAST if i == total-1 else FLAG_NORMAL
+        header = struct.pack('!HBIH I B'.replace(' ', ''),
+                             MAGIC_NUMBER, TYPE_DATA, i, len(chunk), total, flags)
+        checksum = compute_checksum(header + chunk)
+        packet = header + checksum + chunk
+        self.socket.sendto(packet, addr)
+        st['last_send'] = time.time()
+        logging.info(f"Enviado segmento {i}/{total-1} para {addr}")
+
+    def handle_ack(self, addr: Tuple[str,int], seq: int):
+        st = self.clients.get(addr)
+        if not st or seq != st['current']: return
+        st['current'] += 1
+        st['retries'] = 0
+        self.send_next(addr)
+
     def check_retransmissions(self):
-        """Check for packets that need retransmission due to timeout"""
-        current_time = time.time()
-        
-        for client_address, client in list(self.clients.items()):
-            if current_time - client['last_send_time'] > TIMEOUT:
-                # Timeout occurred
-                if client['retries'] >= MAX_RETRIES:
-                    print(f"Max retries reached for {client_address}, aborting transfer")
-                    client['file'].close()
-                    del self.clients[client_address]
+        now = time.time()
+        for addr, st in list(self.clients.items()):
+            if now - st['last_send'] > TIMEOUT:
+                if st['retries'] >= MAX_RETRIES:
+                    logging.error(f"Abortando {addr} após {MAX_RETRIES} falhas")
+                    st['file'].close()
+                    del self.clients[addr]
                 else:
-                    print(f"Timeout for segment {client['current_segment']}, retransmitting")
-                    client['retries'] += 1
-                    client['last_send_time'] = current_time
-                    
-                    # Resend the current segment
-                    file = client['file']
-                    current_segment = client['current_segment']
-                    total_segments = client['total_segments']
-                    
-                    # Read payload from file again
-                    file.seek(current_segment * MAX_PAYLOAD)
-                    payload = file.read(MAX_PAYLOAD)
-                    
-                    # Determine if this is the last segment
-                    is_last = (current_segment == total_segments - 1)
-                    flags = FLAG_LAST if is_last else FLAG_NORMAL
-                    
-                    # Resend the packet
-                    self.send_data_packet(client_address, current_segment, payload, total_segments, flags)
-    
-    def send_error(self, client_address: Tuple[str, int], message: str):
-        """Send an error message to the client"""
-        print(f"Sending error to {client_address}: {message}")
-        
-        payload = message.encode('utf-8')
-        
-        # Prepare header without checksum
-        header_without_checksum = struct.pack(
-            '!HIBHIB', 
-            MAGIC_NUMBER, 
-            TYPE_ERROR, 
-            0,  # seq_num not relevant for error 
-            len(payload), 
-            0,  # total_segments not relevant for error
-            0   # flags not relevant for error
-        )
-        
-        # Calculate checksum
-        checksum = zlib.crc32(header_without_checksum + payload) & 0xFFFFFFFF
-        
-        # Complete header with checksum
-        header = header_without_checksum + struct.pack('!I', checksum)
-        
-        # Send the packet
-        self.socket.sendto(header + payload, client_address)
+                    st['retries'] += 1
+                    logging.warning(f"Timeout de ACK para {addr}, retransmitindo seq={st['current']}")
+                    self.send_next(addr)
 
-def main():
-    parser = argparse.ArgumentParser(description="UDP File Transfer Server")
-    parser.add_argument("--port", type=int, default=5000, help="Port to listen on")
-    parser.add_argument("--directory", type=str, default="./files", help="Directory containing files to serve")
-    
+    def resend_segment(self, addr: Tuple[str,int], seq_req: int):
+        st = self.clients.get(addr)
+        if not st or seq_req < 0 or seq_req >= st['total']: return
+        prev = st['current']
+        st['current'] = seq_req
+        self.send_next(addr)
+        st['current'] = prev
+
+    def send_error(self, addr: Tuple[str,int], msg: str):
+        payload = msg.encode('utf-8')
+        header = struct.pack('!HBIH I B'.replace(' ', ''),
+                             MAGIC_NUMBER, TYPE_ERROR, 0, len(payload), 0, 0)
+        checksum = compute_checksum(header + payload)
+        self.socket.sendto(header + checksum + payload, addr)
+        logging.error(f"Erro enviado a {addr}: {msg}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="UDP File Server confiável")
+    parser.add_argument('port', type=int, help='Porta UDP (>1024)')
+    parser.add_argument('--dir', type=str, default='.', help='Diretório de arquivos (opcional)')
     args = parser.parse_args()
-    
-    # Create directory if it doesn't exist
-    if not os.path.exists(args.directory):
-        os.makedirs(args.directory)
-    
-    server = UDPServer(args.port, args.directory)
-    server.run()
-
-if __name__ == "__main__":
-    main()
+    UDPServer(args.port, args.dir).run()
