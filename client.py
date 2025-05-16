@@ -1,17 +1,12 @@
 """
-Exemplo de requisição no cliente no PowerShell ou terminal:
-
-  python cliente_modificado.py GET 0.0.0.0:5000/teste_1mb.dat --loss 5
-
-Onde:
-  GET           - verbo de requisição sobre UDP
-  0.0.0.0:5000  - IP e porta do servidor
-  teste_1mb.dat - nome do arquivo a ser baixado
-  --loss 5      - taxa de perda intencional de 5%
+Uso:
+  python client.py GET 127.0.0.1:5000/teste_1mb.dat --loss 5
 """
+
 import socket
 import argparse
 import struct
+import uuid
 import zlib
 import random
 import time
@@ -19,24 +14,24 @@ import logging
 import os
 from typing import Dict, Set, Tuple
 
+# --- Configuração de logs ---
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 
+# --- Protocolo ---
 MAGIC_NUMBER = 0x0000
-MAX_PAYLOAD   = 1024 * 8
-HEADER_SIZE   = 18 # 14 bytes de campos + 4 bytes de checksum
+MAX_PAYLOAD  = 1500
+HEADER_SIZE  = 18
+MAX_RETRIES  = 3
 
-TYPE_REQUEST = 0
-TYPE_DATA    = 1
-TYPE_ACK     = 2
-TYPE_ERROR   = 3
+TYPE_REQ, TYPE_DATA, TYPE_ACK, TYPE_ERR = 0,1,2,3
+
 
 
 def compute_checksum(data: bytes) -> bytes:
-    """Calcula checksum CRC32 em 4 bytes big-endian"""
-    checksum = zlib.crc32(data) & 0xFFFFFFFF
-    return struct.pack('!I', checksum)
+    return struct.pack('!I', zlib.crc32(data) & 0xFFFFFFFF)
+
 
 class UDPClient:
     def __init__(self, loss: int):
@@ -44,105 +39,137 @@ class UDPClient:
         self.sock.settimeout(2.0)
         self.loss_rate = loss
         self.segments: Dict[int, bytes] = {}
-        self.lost: Set[int] = set()
         self.start_time = None
 
     def parse_target(self, target: str) -> Tuple[str,int,str]:
-        """Interpreta string IP:Port/arquivo.ext"""
         ipport, fname = target.split('/', 1)
         ip, port = ipport.split(':')
         return ip, int(port), fname
 
-    def make_request(self, fname: str) -> bytes:
-        """Monta pacote REQUEST GET /fname"""
-        txt = f"GET /{fname}".encode('utf-8')
-        header = struct.pack('!HBIH I B'.replace(' ', ''),
-                             MAGIC_NUMBER, TYPE_REQUEST, 0, len(txt), 0, 0)
-        return header + compute_checksum(header + txt) + txt
+    def make_request(self, text: str) -> bytes:
+        hdr = struct.pack('!HBIHIB',
+                          MAGIC_NUMBER, TYPE_REQ, 0,
+                          len(text), 0, 0)
+        return hdr + compute_checksum(hdr + text.encode()) + text.encode()
 
     def make_ack(self, seq: int) -> bytes:
-        """Monta pacote ACK para seq informado"""
-        header = struct.pack('!HBIH I B'.replace(' ', ''),
-                             MAGIC_NUMBER, TYPE_ACK, seq, 0, 0, 0)
-        return header + compute_checksum(header)
+        hdr = struct.pack('!HBIHIB',
+                          MAGIC_NUMBER, TYPE_ACK, seq,
+                          0, 0, 0)
+        return hdr + compute_checksum(hdr)
 
     def start(self, command: str, target: str):
-        """Executa o download: ENVIA REQUEST, recebe e monta arquivo"""
         if command.upper() != 'GET':
-            logging.error(f"Comando inválido: {command}. Use GET.")
+            logging.error("Comando inválido. Use GET.")
             return
+
         ip, port, fname = self.parse_target(target)
         addr = (ip, port)
+        os.makedirs('received', exist_ok=True)
+        uid = uuid.uuid4().hex[:8]
+
         logging.info(f"Conectando a {ip}:{port} para baixar '{fname}'")
-        # Envia pacote REQUEST
-        self.sock.sendto(self.make_request(fname), addr)
+        # envia GET
+        self.sock.sendto(self.make_request(f"GET /{fname}"), addr)
         self.start_time = time.time()
         total = None
 
+        # 1) recepção inicial
         while True:
             try:
                 packet, _ = self.sock.recvfrom(MAX_PAYLOAD + HEADER_SIZE)
-                header = packet[:HEADER_SIZE]
-                magic, ptype, seq, size, tot, flags, recv_crc = \
-                    struct.unpack('!HBIH I B4s'.replace(' ', ''), header)
-                payload = packet[HEADER_SIZE:HEADER_SIZE+size]
-                if magic != MAGIC_NUMBER:
-                    continue
-                # Verifica CRC
-                if compute_checksum(header[:-4] + payload) != recv_crc:
-                    logging.warning(f"Corrupção no segmento {seq}")
-                    self.lost.add(seq)
-                    continue
-                # Simula perda intencional
-                if random.randint(1,100) <= self.loss_rate:
-                    logging.warning(f"Descartei intencionalmente segmento {seq}")
-                    self.lost.add(seq)
-                    continue
-                if ptype == TYPE_DATA:
-                    if total is None:
-                        total = tot
-                        logging.info(f"Esperando {total} segmentos...")
-                    logging.info(f"Recebido segmento {seq}/{total-1}")
-                    # Envia ACK
-                    self.sock.sendto(self.make_ack(seq), addr)
-                    # Armazena payload
-                    self.segments[seq] = payload
-                    if len(self.segments) == total - len(self.lost):
-                        break
-                elif ptype == TYPE_ERROR:
-                    logging.error(f"Erro do servidor: {payload.decode()}")
-                    return
             except socket.timeout:
-                logging.warning("Timeout de recepção")
+                logging.warning("Timeout de recepção (possível fim de envio)")
                 break
 
-        # Retransmissões sob demanda
-        if self.lost:
-            logging.info(f"Pacotes perdidos: {sorted(self.lost)}")
+            header = packet[:HEADER_SIZE]
+            magic, ptype, seq, size, tot, flags, recv_crc = struct.unpack('!HBIHIB4s', header)
+            payload = packet[HEADER_SIZE:HEADER_SIZE+size]
+
+            if magic != MAGIC_NUMBER:
+                continue
+
+            # integridade
+            if compute_checksum(header[:-4] + payload) != recv_crc:
+                logging.warning(f"Corrupção no segmento {seq}")
+                self.sock.sendto(self.make_ack(seq), addr)
+                continue
+
+            # simula perda
+            if random.randint(1,100) <= self.loss_rate:
+                logging.warning(f"Simulação de perda: descartou segmento {seq}")
+                self.sock.sendto(self.make_ack(seq), addr)
+                continue
+
+            if ptype == TYPE_DATA:
+                if total is None:
+                    total = tot
+                    logging.info(f"Esperando {total} segmentos...")
+                logging.info(f"Recebido segmento {seq}/{total-1}")
+                self.sock.sendto(self.make_ack(seq), addr)
+                self.segments.setdefault(seq, payload)
+                if len(self.segments) == total:
+                    logging.info("Todos os segmentos recebidos")
+                    break
+
+            elif ptype == TYPE_ERR:
+                logging.error(f"Erro do servidor: {payload.decode()}")
+                return
+
+        if total is None:
+            logging.error("Não recebeu metadados de total de segmentos.")
+            return
+
+        # 2) recuperação
+        missing = sorted(set(range(total)) - set(self.segments.keys()))
+        if missing:
+            logging.info(f"Segmentos faltantes: {missing}")
             ans = input("Recuperar perdidos? (s/n): ")
             if ans.lower().startswith('s'):
-                for seq in sorted(self.lost):
-                    msg = f"RESEND {seq}".encode('utf-8')
-                    hdr = struct.pack('!HBIH I B'.replace(' ', ''),
-                                      MAGIC_NUMBER, TYPE_REQUEST, 0, len(msg), 0, 0)
-                    self.sock.sendto(hdr + compute_checksum(hdr + msg) + msg, addr)
-                    # Recebe reenvio
-                    data, _ = self.sock.recvfrom(MAX_PAYLOAD + HEADER_SIZE)
-                    hdr2 = data[:HEADER_SIZE]
-                    _, _, seq2, size2, _, _, _ = \
-                        struct.unpack('!HBIH I B4s'.replace(' ', ''), hdr2)
-                    payload2 = data[HEADER_SIZE:HEADER_SIZE+size2]
-                    self.segments[seq2] = payload2
-                    logging.info(f"Recuperado segmento {seq2}")
+                for seq in missing:
+                    recovered = False
+                    for attempt in range(1, MAX_RETRIES+1):
+                        # envia RESEND
+                        self.sock.sendto(self.make_request(f"RESEND {seq}"), addr)
+                        try:
+                            data, _ = self.sock.recvfrom(MAX_PAYLOAD + HEADER_SIZE)
+                        except socket.timeout:
+                            logging.warning(f"Tentativa {attempt}/{MAX_RETRIES} sem resposta para seq {seq}")
+                            continue
 
-        # Montagem final
-        duration = time.time() - self.start_time
-        out = f"recebido_{os.path.basename(fname)}"
+                        h2 = data[:HEADER_SIZE]
+                        magic2, ptype2, seq2, size2, _, _, crc2 = struct.unpack('!HBIHIB4s', h2)
+                        p2 = data[HEADER_SIZE:HEADER_SIZE+size2]
+                        if magic2 == MAGIC_NUMBER and ptype2 == TYPE_DATA \
+                           and seq2 == seq and compute_checksum(h2[:-4]+p2) == crc2:
+                            logging.info(f"Recuperado segmento {seq2}")
+                            self.sock.sendto(self.make_ack(seq2), addr)
+                            self.segments[seq2] = p2
+                            recovered = True
+                            break
+                        else:
+                            logging.warning(f"Resposta inesperada ou CRC inválido no reenvio de seq {seq}")
+                    if not recovered:
+                        logging.error(f"Falha ao recuperar segmento {seq} após {MAX_RETRIES} tentativas")
+            else:
+                # grava parcial
+                out = os.path.join('received', f"{uid}_{fname}")
+                with open(out, 'wb') as f:
+                    for i in sorted(self.segments):
+                        f.write(self.segments[i])
+                logging.info(f"Arquivo parcial salvo em {out}")
+                return
+
+        # 3) montagem final
+        out = os.path.join('received', f"{uid}_{fname}")
         with open(out, 'wb') as f:
-            for i in sorted(self.segments):
+            for i in range(total):
                 f.write(self.segments[i])
-        logging.info(f"Arquivo salvo como {out}")
-        logging.info(f"Transferência concluída em {duration:.2f}s, {len(self.segments)} segmentos, {len(self.lost)} perdidos")
+        duration = time.time() - self.start_time
+        logging.info(f"Arquivo completo salvo em {out}")
+        logging.info(f"Transferência concluída em {duration:.2f}s, {total} segmentos, "
+                     f"{len(missing)} recuperados")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="UDP File Client confiável")

@@ -1,0 +1,11 @@
+# Diretórios com arquivos de dados
+files/
+received/
+
+# Arquivos Python comuns
+__pycache__/
+*.py[cod]
+
+# Outros arquivos temporários ou logs
+*.log
+*.tmp

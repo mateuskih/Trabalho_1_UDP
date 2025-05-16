@@ -1,175 +1,204 @@
-import socket
-import argparse
-import os
-import struct
-import zlib
-import time
-import select
-import logging
+"""
+Uso:
+  python server.py 5000
+
+"""
+
+import socket, threading, queue, os, struct, zlib, time, logging
 from typing import Tuple, Dict
 
-# Configuração de logging com timestamp
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s [%(levelname)s] %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 
-# --- Configurações do protocolo ---
-MAGIC_NUMBER = 0x0000       # Número mágico para identificação de pacotes válidos
-MAX_PAYLOAD = 1024 * 8      # 8 KB por segmento
-HEADER_SIZE = 18            # Header + checksum
-TIMEOUT = 0.5               # Timeout para retransmissão (s)
-MAX_RETRIES = 5             # Máximo de retransmissões
+MTU, IP_HDR, UDP_HDR = 1500, 20, 8
+MAGIC = 0x0000
+HDR_FMT = '!HBIHIB4s'  # MAGIC(2) TYPE(1) SEQ(4) SIZE(2) TOTAL(4) FLAGS(1) CRC(4)
+HDR_SZ = struct.calcsize(HDR_FMT)
+MAX_PAYLOAD = MTU - IP_HDR - UDP_HDR - HDR_SZ
 
-# Tipos de pacote
-TYPE_REQUEST = 0
-TYPE_DATA    = 1
-TYPE_ACK     = 2
-TYPE_ERROR   = 3
+TIMEOUT      = 2.0
+MAX_RETRIES  = 3
+RECOVER_WIN  = 5.0    # segundos para aceitar RESENDs pós-FLAG_LAST
+LATENCY      = 0.05
 
-# Flags
-FLAG_NORMAL = 0
-FLAG_LAST   = 1
+TYPE_REQ, TYPE_DATA, TYPE_ACK, TYPE_ERR = 0,1,2,3
+FLAG_NORMAL, FLAG_LAST = 0,1
 
+def crc32(data: bytes) -> bytes:
+    return struct.pack('!I', zlib.crc32(data) & 0xFFFFFFFF)
 
-def compute_checksum(data: bytes) -> bytes:
-    """
-    Calcula checksum CRC32 em 4 bytes big-endian
-    """
-    checksum = zlib.crc32(data) & 0xFFFFFFFF
-    return struct.pack('!I', checksum)
-
-class UDPServer:
-    def __init__(self, port: int, directory: str):
-        """
-        Inicia socket UDP e prepara estado
-        """
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("", port))
-        self.directory = directory
-        self.clients: Dict[Tuple[str,int], dict] = {}
-        logging.info(f"Servidor iniciado em 0.0.0.0:{port}, servindo {directory}")
+class ClientHandler(threading.Thread):
+    def __init__(self, server, addr, q):
+        super().__init__(daemon=True)
+        self.srv = server
+        self.addr = addr
+        self.q = q
+        self.state = None
+        self.finished_at = None
 
     def run(self):
-        """Loop: receber pacotes e retransmitir"""
+        # 1) espera REQUEST
         try:
-            while True:
-                ready,_,_ = select.select([self.socket], [], [], 1.0)
-                if ready:
-                    data, addr = self.socket.recvfrom(MAX_PAYLOAD + HEADER_SIZE)
-                    logging.info(f"Pacote recebido de {addr}, tamanho {len(data)} bytes")
-                    self.handle_packet(data, addr)
-                self.check_retransmissions()
-        except KeyboardInterrupt:
-            logging.info("Servidor encerrado pelo usuário")
+            pkt = self.q.get(timeout=TIMEOUT)
+        except queue.Empty:
+            logging.error(f"{self.addr}: sem REQUEST, abortando")
+            return self.cleanup()
 
-    def handle_packet(self, data: bytes, addr: Tuple[str,int]):
-        if len(data) < HEADER_SIZE:
-            logging.warning(f"Pacote muito curto de {addr}")
-            return
-        header = data[:HEADER_SIZE]
-        magic, ptype, seq, size, total, flags, recv_checksum = \
-            struct.unpack('!HBIH I B4s'.replace(' ', ''), header)
-        if magic != MAGIC_NUMBER:
-            logging.warning(f"Magic inválido de {addr}")
-            return
-        payload = data[HEADER_SIZE:HEADER_SIZE+size]
-        calc = compute_checksum(header[:-4] + payload)
-        if calc != recv_checksum:
-            logging.error(f"CRC inválido de {addr}, seq={seq}")
-            return
-        # Processa tipos
-        if ptype == TYPE_REQUEST:
-            text = payload.decode('utf-8')
-            if text.startswith("GET /"):
-                filename = text[5:]
-                logging.info(f"Requisição GET de {addr}: {filename}")
-                self.start_transfer(filename, addr)
-            elif text.startswith("RESEND "):
-                seq_req = int(text.split()[1])
-                logging.info(f"Requisição RESEND de {addr}: seq={seq_req}")
-                self.resend_segment(addr, seq_req)
-        elif ptype == TYPE_ACK:
-            logging.info(f"ACK recebido de {addr}, seq={seq}")
-            self.handle_ack(addr, seq)
+        h,p = pkt[:HDR_SZ], pkt[HDR_SZ:]
+        magic, ptype, _, size, _, _, _ = struct.unpack(HDR_FMT, h)
+        if magic!=MAGIC or ptype!=TYPE_REQ:
+            logging.error(f"{self.addr}: primeiro pacote inválido")
+            return self.cleanup()
 
-    def start_transfer(self, filename: str, addr: Tuple[str,int]):
-        path = os.path.join(self.directory, filename)
+        text = p[:size].decode().strip().split()
+        if len(text)!=2 or text[0].upper()!='GET':
+            logging.error(f"{self.addr}: REQUEST mal formatado: {p[:size]!r}")
+            return self.cleanup()
+
+        fname = text[1].lstrip('/')
+        path = os.path.join(self.srv.directory, fname)
         if not os.path.exists(path):
-            self.send_error(addr, f"Arquivo {filename} não encontrado")
-            return
-        filesize = os.path.getsize(path)
-        total_segments = (filesize + MAX_PAYLOAD - 1) // MAX_PAYLOAD
-        file_obj = open(path, 'rb')
-        self.clients[addr] = {
-            'file': file_obj,
-            'total': total_segments,
+            self.srv.send_error(self.addr, f"'{fname}' não encontrado")
+            return self.cleanup()
+
+        # 2) inicializa estado
+        sz = os.path.getsize(path)
+        total = (sz + MAX_PAYLOAD-1)//MAX_PAYLOAD
+        f = open(path,'rb')
+        self.state = {
+            'file': f,
+            'total': total,
             'current': 0,
-            'last_send': 0.0,
             'retries': 0,
-            'start_time': time.time()
+            'last_send': 0.0,
+            'last_seq': total-1
         }
-        logging.info(f"Iniciando transferência de {filename}: {filesize} bytes em {total_segments} segmentos para {addr}")
-        self.send_next(addr)
+        logging.info(f"{self.addr}: enviando '{fname}' ({sz}B em {total} segs)")
+        self.send_next()
 
-    def send_next(self, addr: Tuple[str,int]):
-        st = self.clients.get(addr)
-        if not st: return
-        i, total = st['current'], st['total']
-        if i >= total:
-            duration = time.time() - st['start_time']
-            logging.info(f"Transferência completa para {addr} em {duration:.2f}s")
-            return
-        file_obj = st['file']
-        file_obj.seek(i * MAX_PAYLOAD)
-        chunk = file_obj.read(MAX_PAYLOAD)
-        flags = FLAG_LAST if i == total-1 else FLAG_NORMAL
-        header = struct.pack('!HBIH I B'.replace(' ', ''),
-                             MAGIC_NUMBER, TYPE_DATA, i, len(chunk), total, flags)
-        checksum = compute_checksum(header + chunk)
-        packet = header + checksum + chunk
-        self.socket.sendto(packet, addr)
-        st['last_send'] = time.time()
-        logging.info(f"Enviado segmento {i}/{total-1} para {addr}")
+        # 3) loop: ACKs, RESEND, timeout
+        while True:
+            # se último ACK recebido, abre janela de RESEND
+            if self.finished_at:
+                try:
+                    pkt = self.q.get(timeout=RECOVER_WIN)
+                except queue.Empty:
+                    logging.info(f"{self.addr}: tempo de recuperação esgotado")
+                    break
+            else:
+                try:
+                    pkt = self.q.get(timeout=TIMEOUT)
+                except queue.Empty:
+                    if not self.retransmit():
+                        logging.error(f"{self.addr}: retries excedidos")
+                        break
+                    continue
 
-    def handle_ack(self, addr: Tuple[str,int], seq: int):
-        st = self.clients.get(addr)
-        if not st or seq != st['current']: return
-        st['current'] += 1
-        st['retries'] = 0
-        self.send_next(addr)
+            h = pkt[:HDR_SZ]; b = pkt[HDR_SZ:]
+            magic, ptype, seq, size, _, flags, crc_recv = struct.unpack(HDR_FMT, h)
+            payload = b[:size]
+            if magic!=MAGIC or crc32(h[:-4]+payload)!=crc_recv:
+                logging.warning(f"{self.addr}: CRC/magic inválido")
+                continue
 
-    def check_retransmissions(self):
-        now = time.time()
-        for addr, st in list(self.clients.items()):
-            if now - st['last_send'] > TIMEOUT:
-                if st['retries'] >= MAX_RETRIES:
-                    logging.error(f"Abortando {addr} após {MAX_RETRIES} falhas")
-                    st['file'].close()
-                    del self.clients[addr]
+            if ptype==TYPE_ACK:
+                logging.info(f"{self.addr}: ACK seq={seq}")
+                # se é o ACK do último segmento, marca finish
+                if seq==self.state['last_seq']:
+                    self.finished_at = time.time()
+                    logging.info(f"{self.addr}: ACK de FLAG_LAST recebido")
+                self.handle_ack(seq)
+
+            elif ptype==TYPE_REQ:
+                txt = payload.decode().strip().split()
+                if txt[0].upper()=='RESEND':
+                    seqr = int(txt[1])
+                    logging.info(f"{self.addr}: RESEND seq={seqr}")
+                    self.resend_segment(seqr)
                 else:
-                    st['retries'] += 1
-                    logging.warning(f"Timeout de ACK para {addr}, retransmitindo seq={st['current']}")
-                    self.send_next(addr)
+                    logging.warning(f"{self.addr}: REQUEST inesperado: {txt!r}")
 
-    def resend_segment(self, addr: Tuple[str,int], seq_req: int):
-        st = self.clients.get(addr)
-        if not st or seq_req < 0 or seq_req >= st['total']: return
-        prev = st['current']
-        st['current'] = seq_req
-        self.send_next(addr)
-        st['current'] = prev
+        self.cleanup()
 
-    def send_error(self, addr: Tuple[str,int], msg: str):
-        payload = msg.encode('utf-8')
-        header = struct.pack('!HBIH I B'.replace(' ', ''),
-                             MAGIC_NUMBER, TYPE_ERROR, 0, len(payload), 0, 0)
-        checksum = compute_checksum(header + payload)
-        self.socket.sendto(header + checksum + payload, addr)
-        logging.error(f"Erro enviado a {addr}: {msg}")
+    def send_next(self):
+        st = self.state; i,tot = st['current'], st['total']
+        if i>=tot: return
+        f=st['file']; f.seek(i*MAX_PAYLOAD)
+        chunk=f.read(MAX_PAYLOAD)
+        fl = FLAG_LAST if i==tot-1 else FLAG_NORMAL
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="UDP File Server confiável")
-    parser.add_argument('port', type=int, help='Porta UDP (>1024)')
-    parser.add_argument('--dir', type=str, default='.', help='Diretório de arquivos (opcional)')
-    args = parser.parse_args()
-    UDPServer(args.port, args.dir).run()
+        h = struct.pack('!HBIHIB', MAGIC, TYPE_DATA, i, len(chunk), tot, fl)
+        pkt = h + crc32(h+chunk) + chunk
+        self.srv.socket.sendto(pkt, self.addr)
+        
+        st['last_send']=time.time()
+        logging.info(f"{self.addr}: enviado seg {i}/{tot-1}")
+        time.sleep(LATENCY)
+
+    def handle_ack(self, seq):
+        st=self.state
+        if seq==st['current']:
+            st['current']+=1; st['retries']=0
+            self.send_next()
+
+    def retransmit(self):
+        st=self.state
+        if time.time()-st['last_send']<TIMEOUT: return True
+        if st['retries']>=MAX_RETRIES: return False
+        st['retries']+=1
+        logging.warning(f"{self.addr}: timeout seg {st['current']}, retry")
+        self.send_next()
+        return True
+
+    def resend_segment(self, n):
+        st=self.state
+        if 0<=n<st['total']:
+            prev=st['current']; st['current']=n
+            self.send_next(); st['current']=prev
+
+    def cleanup(self):
+        if self.state:
+            self.state['file'].close()
+        self.srv.remove_client(self.addr)
+        logging.info(f"{self.addr}: handler finalizado")
+
+
+class UDPServer:
+    def __init__(self, port:int):
+        self.socket=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        self.socket.bind(('',port))
+        self.directory='files'
+        os.makedirs(self.directory,exist_ok=True)
+        self.queues:Dict[Tuple[str,int],queue.Queue]={}
+        logging.info(f"Servidor iniciado UDP 0.0.0.0:{port}, servindo 'files/'")
+
+    def run(self):
+        while True:
+            try:
+                data,addr=self.socket.recvfrom(HDR_SZ+MAX_PAYLOAD)
+            except ConnectionResetError:
+                continue
+            if addr not in self.queues:
+                q=queue.Queue()
+                self.queues[addr]=q
+                ClientHandler(self,addr,q).start()
+            self.queues[addr].put(data)
+
+    def remove_client(self,addr):
+        self.queues.pop(addr,None)
+
+    def send_error(self,addr,msg):
+        p=msg.encode()
+        h=struct.pack('!HBIHIB',MAGIC,TYPE_ERR,0,len(p),0,0)
+        pkt=h+crc32(h+p)+p
+        self.socket.sendto(pkt,addr)
+        logging.error(f"{addr}: erro '{msg}' enviado")
+
+
+if __name__=='__main__':
+    import argparse
+    p=argparse.ArgumentParser()
+    p.add_argument('port',type=int)
+    args=p.parse_args()
+    UDPServer(args.port).run()

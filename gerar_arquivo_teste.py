@@ -31,7 +31,7 @@ def gerar_arquivo_teste(nome_arquivo: str, tamanho_mb: int):
 
 if __name__ == '__main__':
     # Gera dois arquivos de teste: 1MB e 10MB
-    gerar_arquivo_teste('teste_1mb.dat', 1)
-    gerar_arquivo_teste('teste_10mb.dat', 10) 
-    gerar_arquivo_teste('teste_100mb.dat', 100) 
+    gerar_arquivo_teste('teste_15mb.dat', 15)
+    # gerar_arquivo_teste('teste_10mb.dat', 10) 
+    # gerar_arquivo_teste('teste_100mb.dat', 100) 
 #   gerar_arquivo_teste('teste_1gb.dat', 1024) 
